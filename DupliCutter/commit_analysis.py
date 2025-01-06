@@ -4,8 +4,8 @@ from openai import AzureOpenAI
 
 # Azure OpenAI Configuration
 endpoint = os.getenv("ENDPOINT_URL", "https://aep-portal-hackathon-openai.openai.azure.com/")
-deployment = os.getenv("DEPLOYMENT_NAME", "TestDeployment0621")
-subscription_key = os.getenv("AZURE_OPENAI_API_KEY", {os.getenv("AZURE_OPENAI_API_KEY")})
+deployment = os.getenv("DEPLOYMENT_NAME", "text-embedding-3-small")
+subscription_key = os.getenv("AZURE_OPENAI_API_KEY", "ROVN0oYw5UmCyykCSrQDMZ8aQ1cePL8W7ET1nJ7B0fM3mCSLcybkJQQJ99ALACYeBjFXJ3w3AAABACOG6hLG")
 
 # Initialize Azure OpenAI client
 client = AzureOpenAI(
