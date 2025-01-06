@@ -1,5 +1,6 @@
 import os
 import subprocess
+import json
 from openai import AzureOpenAI
 from scipy.spatial.distance import cosine
 import logging
@@ -20,76 +21,32 @@ client = AzureOpenAI(
 )
 
 def get_git_diff():
-    """
-    Gets the git diff of the latest staged changes.
-
-    This function retrieves the differences between the files in the staging area and the latest committed state.
-
-    Returns:
-        str: The git diff output as a string, or None if an error occurs.
-
-    Exceptions:
-        Handles CalledProcessError if the git command fails (e.g., no repository, no staged changes).
-    """
+    """Gets the git diff of the latest commit."""
     try:
-        # Run the `git diff --cached` command to get the staged changes
-        # `universal_newlines=True` ensures the output is returned as a string
         diff_output = subprocess.check_output(["git", "diff", "--cached"], universal_newlines=True)
         return diff_output
     except subprocess.CalledProcessError as e:
         print(f"Error running git diff: {e}")
         return None
 
-def analyze_changes(changes):
-    """
-    Analyze changes and generate suggestions using GPT-4.
-    
-    Parameters:
-    - changes (str): A string containing the code changes to be analyzed.
-
-    Returns:
-    - str: A structured response containing suggestions for improvement.
-    """
-    prompt = (
-        "You are an AI assistant reviewing code changes. Provide structured suggestions like this:\n\n"
-        "File: <File Name>\nIssue: <Brief description of the issue>\n"
-        "What Should Be Done: <Action to resolve the issue>\nWhy It Should Be Done: <Reasoning>\n\n"
-        "---\n\nChanges:\n" + changes
-    )
-    # Call the GPT model with the provided prompt and parameters.
-    response = client.chat.completions.create(
-        model=gpt_model,  # Specify the GPT model to use.
-        messages=[{"role": "user", "content": prompt}],  # Provide the prompt in the user role.
-        max_tokens=800,  # Limit the response to 800 tokens to control output length.
-        temperature=0.7,  # Set the temperature to balance creativity and focus.
-    )
-    return response.choices[0].message.content
-
-def is_code_file(filepath):
-    """Check if a file is likely a code file by its extension."""
-    file_extensions = ['.tsx', '.jsx']
-    
+def is_text_file(filepath):
+    """Check if a file is likely a text file by its extension."""
+    file_extensions = ['.tsx','.jsx', '.js']
+    # Add more text-based extensions as needed
     return any(filepath.endswith(ext) for ext in file_extensions)
 
 def get_repo_files():
-    """
-    Get all files tracked by Git, filtering out non-code files.
-    Uses the `git ls-files` command to list tracked files and applies a filter
-    based on file extensions defined in `is_code_file`.
-    """
-    # Run the `git ls-files` command to get all tracked files in the repository
+    """Get all files tracked by Git, filtering out non-text files."""
     result = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
-    
-    # If the Git command fails, raise an error
     if result.returncode != 0:
         raise RuntimeError("Failed to list repository files.")
     
-    # Extract the list of tracked files from the command output
+    # Extract list of tracked files
     tracked_files = result.stdout.strip().split("\n")
     
-    text_files = [file for file in tracked_files if is_code_file(file)]
+    # Filter out non-text files
+    text_files = [file for file in tracked_files if is_text_file(file)]
     
-    # Print the filtered list of code files
     print("Tracked text files in the repository:")
     for file in text_files:
         print(file)
@@ -103,7 +60,7 @@ def read_file_content(filepath):
 
 def calculate_chunk_size(content_size, max_token_limit=120000, num_chunks=40):
     """
-    Dynamically calculates the chunk size for splitting content.
+    Dynamically calculates chunk size for splitting content.
     Args:
         content_size (int): The size of the content (in characters or tokens).
         max_token_limit (int): The maximum token limit allowed (default: 120000).
@@ -115,31 +72,20 @@ def calculate_chunk_size(content_size, max_token_limit=120000, num_chunks=40):
 
 def split_into_chunks(text, max_token_limit=120000, num_chunks=40):
     """
-    Splits text into smaller chunks that fit within the calculated token limit.
-    Args:
-        text (str): The input text to split.
-        max_token_limit (int): The maximum token limit allowed (default: 120000).
-        num_chunks (int): Approximate number of chunks to split into (default: 40).
-    Returns:
-        list: A list of text chunks.
+    Split text into smaller chunks within the token limit for embeddings.
     """
     chunk_size = calculate_chunk_size(len(text), max_token_limit, num_chunks)
-    
-    # Split the text into lines for easier chunking
     lines = text.splitlines()
-    chunks = []  # List to store chunks
-    current_chunk = []  # Buffer for the current chunk
+    chunks = []
+    current_chunk = []
 
-    # Iterate through lines and add them to the current chunk until the size limit is reached
     for line in lines:
         if len(" ".join(current_chunk) + " " + line) <= chunk_size:
             current_chunk.append(line)
         else:
-            # Save the completed chunk and start a new one
             chunks.append("\n".join(current_chunk))
             current_chunk = [line]
-
-    # Add the last chunk if it exists
+    
     if current_chunk:
         chunks.append("\n".join(current_chunk))
     
@@ -147,69 +93,81 @@ def split_into_chunks(text, max_token_limit=120000, num_chunks=40):
 
 def generate_embedding(text):
     """
-    Generates embeddings for the given text. Splits text into manageable chunks if needed.
-    Args:
-        text (str): The input text.
-    Returns:
-        list: A single averaged embedding vector for the input text.
+    Generate embeddings for a given text. If the text is too large, split it into chunks.
     """
-    # Split text into chunks to stay within token limits
     chunks = split_into_chunks(text)
-    chunk_embeddings = []  # Store embeddings for each chunk
+    chunk_embeddings = []
 
-    # Generate embeddings for each chunk
     for chunk in chunks:
         response = client.embeddings.create(
-            input=chunk,  # Input text for the embedding model
-            model=embedding_model,  # The embedding model to use
+            input=chunk,
+            model=embedding_model,
         )
-        # Extract the embedding vector from the response
+        # Access the embedding data correctly
         chunk_embeddings.append(response.data[0].embedding)
     
-    # Average all chunk embeddings to create a single embedding vector
+    # Average the embeddings to create a single vector representation
     avg_embedding = [sum(x) / len(chunks) for x in zip(*chunk_embeddings)]
     return avg_embedding
 
+def is_new_file(filepath):
+    """Check if the file is new by seeing if it exists in the previous commit."""
+    try:
+        subprocess.check_output(["git", "show", f"HEAD^:{filepath}"], stderr=subprocess.STDOUT)
+        return False
+    except subprocess.CalledProcessError:
+        return True
+
 def detect_redundancy(latest_changes, repo_files):
-    """
-    Detect redundancy by comparing the latest changes with repository files.
-    Args:
-        latest_changes (str): The content of the latest changes.
-        repo_files (list): A list of repository files to compare against.
-    Returns:
-        list: A redundancy report containing files with high similarity to the latest changes.
-    """
-    # Generate an embedding for the latest changes
-    latest_embedding = generate_embedding(latest_changes)
-    redundancy_report = []  # Store details of redundant files
+    """Detect redundancy in repository files."""
+    redundancy_report = []
 
-    # Compare the latest embedding with embeddings of all repository files
     for file in repo_files:
-        try:
-            # Read the content of the current file
-            file_content = read_file_content(file)
+        if is_new_file(file):
+            logging.info(f"Skipping new file {file} as it has no previous commit history.")
+            continue
 
-            # Generate an embedding for the file content
+        try:
+            # Get the previous version of the file from the previous commit
+            file_content = subprocess.check_output(
+                ["git", "show", f"HEAD^:{file}"], universal_newlines=True
+            )
+            # latest_file_content = read_file_content(file)
+            latest_embedding = generate_embedding(latest_changes)
             file_embedding = generate_embedding(file_content)
 
-            # Calculate similarity between the latest changes and the file
             similarity = 1 - cosine(latest_embedding, file_embedding)
+            logging.info(f"Similarity between the current and previous state of {file}: {similarity}")
 
-            # If the similarity exceeds the threshold, record the redundancy
-            if similarity > 0.9:  # Threshold for redundancy detection
+            if similarity > 0.7:  # Threshold for redundancy detection
                 redundancy_report.append({
-                    "file": file,            # File name
-                    "similarity": similarity, # Similarity score
-                    "content": file_content,  # File content
-                    "changes": latest_changes,  # Latest changes
+                    "file": file,
+                    "similarity": similarity,
+                    "content": file_content,
                 })
         except Exception as e:
-            print(f"Error processing file {file}: {e}")
+            logging.error(f"Error processing file {file}: {e}")
             continue
 
     return redundancy_report
 
-def group_similar_files(redundancy_report, threshold=0.02):
+def analyze_changes(changes):
+    """Analyze changes and generate suggestions using GPT-4."""
+    prompt = (
+        "You are an AI assistant reviewing code changes. Provide structured suggestions like this:\n\n"
+        "File: <File Name>\nIssue: <Brief description of the issue>\n"
+        "What Should Be Done: <Action to resolve the issue>\nWhy It Should Be Done: <Reasoning>\n\n"
+        "---\n\nChanges:\n" + changes
+    )
+    response = client.chat.completions.create(
+        model=gpt_model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=800,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
+
+def group_similar_files(redundancy_report, threshold=0.005):
     """
     Groups files based on similarity. Files with similarity above the threshold
     (difference in similarity <= threshold) are grouped together for a combined refactoring suggestion.
@@ -240,7 +198,8 @@ def group_similar_files(redundancy_report, threshold=0.02):
 
     return grouped_files
 
-def generate_combined_refactor_suggestions(grouped_files, redundancy_report):
+
+def generate_combined_refactor_suggestions(grouped_files, redundancy_report, latest_changes):
     """Generate combined refactoring suggestions for groups of similar redundant code."""
     suggestions = []
     logging.info("Starting to generate combined refactor suggestions...")
@@ -254,6 +213,9 @@ def generate_combined_refactor_suggestions(grouped_files, redundancy_report):
         for file in group:
             file_redundancy = next(item for item in redundancy_report if item['file'] == file)
             combined_content += f"\n--- Content from {file} ---\n{file_redundancy['content']}"
+
+        # Append the latest changes to the combined content for reference
+        combined_content += f"\n--- Latest Changes ---\n{latest_changes}"
 
         # Split the combined content into chunks
         chunks = split_into_chunks(combined_content)
@@ -287,32 +249,41 @@ def generate_combined_refactor_suggestions(grouped_files, redundancy_report):
     return suggestions
 
 def generate_report(changes, suggestions, redundancy_report, refactor_suggestions):
-    """Generate a combined report in text format."""
+    """Generate a combined report in text and JSON format."""
+    report = {
+        "commit_changes_feedback": suggestions,
+        "redundancy_report": redundancy_report,
+        "refactor_suggestions": refactor_suggestions,
+    }
+
+    # Save JSON report
+    with open("repository_analysis_report.json", "w", encoding="utf-8") as json_file:
+        json.dump(report, json_file, indent=4)
 
     # Save Text Report
-    with open("commit_feedback_report.txt", "w", encoding="utf-8") as text_file:
+    with open("repository_analysis_report.txt", "w", encoding="utf-8") as text_file:
         text_file.write("### Repository Analysis Report ###\n\n")
         text_file.write(f"### Feedback on Latest Commit Changes ###\n\n{suggestions}\n\n")
-
-    with open("commit_redundancy_refactor_report.txt", "w", encoding="utf-8") as text_file:   
         text_file.write("### Redundancy Report ###\n")
         for item in redundancy_report:
             text_file.write(f"File: {item['file']}\nSimilarity: {item['similarity']:.2f}\n\n")
         text_file.write("### Refactoring Suggestions ###\n")
+        # for suggestion in refactor_suggestions:
+        #     text_file.write(f"File: {suggestion['file']}\nSuggestion: {suggestion['refactor_suggestion']}\n\n")
         for suggestion in refactor_suggestions:
             try:
                 # Check if 'file' and 'refactor_suggestion' keys exist in the suggestion
-                group = suggestion.get('group', 'No group specified')  # Default to 'No group specified' if missing
+                file = suggestion.get('file', 'No file specified')  # Default to 'No file specified' if missing
                 refactor_suggestion = suggestion.get('refactor_suggestion', 'No suggestion provided')  # Default message
 
                 # Write the suggestion to the report
-                text_file.write(f"Group: {group}\nSuggestion: {refactor_suggestion}\n\n")
+                text_file.write(f"File: {file}\nSuggestion: {refactor_suggestion}\n\n")
             except KeyError as e:
                 # Log and handle the error
                 print(f"KeyError: {e} in refactor suggestion: {suggestion}")
                 text_file.write("Error: Missing key in refactor suggestion.\n\n")
 
-    print("Reports generated: commit_feedback_report.txt and commit_redundancy_refactor_report.txt")
+    print("Reports generated: repository_analysis_report.json and repository_analysis_report.txt")
 
 def main():
     """Main function to analyze the repository."""
@@ -330,10 +301,11 @@ def main():
 
     # Group similar files based on similarity threshold
     print("Grouping similar files...")
-    grouped_files = group_similar_files(redundancy_report, threshold=0.02)
+    grouped_files = group_similar_files(redundancy_report, threshold=0.005)
 
     print("Generating refactor suggestions...")
-    refactor_suggestions = generate_combined_refactor_suggestions(grouped_files, redundancy_report)
+    # refactor_suggestions = generate_refactor_suggestions(redundancy_report)
+    refactor_suggestions = generate_combined_refactor_suggestions(grouped_files, redundancy_report, changes)
 
     print("Generating final report...")
     generate_report(changes, suggestions, redundancy_report, refactor_suggestions)
